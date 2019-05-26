@@ -3,8 +3,7 @@ from collections import defaultdict
 from functools import wraps
 
 import requests
-
-from bottle import Bottle, request, abort
+from flask import Flask, request, abort, jsonify
 
 
 class Error(Exception):
@@ -13,32 +12,20 @@ class Error(Exception):
         self.retcode = retcode
 
 
-class _ApiClient(object):
-    def __init__(self, api_root=None, access_token=None):
-        self._url = api_root.rstrip('/') if api_root else None
-        self._access_token = access_token
-
-    def __getattr__(self, item):
-        if self._url:
-            return _ApiClient(
-                api_root=self._url + '/' + item,
-                access_token=self._access_token
-            )
-
-    def __call__(self, *args, **kwargs):
+def _api_client(url, access_token=None):
+    def do_call(**kwargs):
         headers = {}
-        if self._access_token:
-            headers['Authorization'] = 'Token ' + self._access_token
-        resp = requests.post(
-            self._url, json=kwargs,
-            headers=headers
-        )
+        if access_token:
+            headers['Authorization'] = 'Token ' + access_token
+        resp = requests.post(url, json=kwargs, headers=headers)
         if resp.ok:
             data = resp.json()
             if data.get('status') == 'failed':
                 raise Error(resp.status_code, data.get('retcode'))
             return data.get('data')
         raise Error(resp.status_code)
+
+    return do_call
 
 
 def _deco_maker(post_type):
@@ -60,67 +47,76 @@ def _deco_maker(post_type):
     return deco_decorator
 
 
-class CQHttp(_ApiClient):
+class CQHttp:
     def __init__(self, api_root=None, access_token=None, secret=None):
-        super().__init__(api_root, access_token)
+        self._api_root = api_root.rstrip('/') if api_root else None
+        self._access_token = access_token
         self._secret = secret
         self._handlers = defaultdict(dict)
-        self._app = Bottle()
-        self._app.post('/')(self._handle)
+        self._server_app = Flask(__name__)
+        self._server_app.route('/', methods=['POST'])(self._handle)
+
+    @property
+    def wsgi(self):
+        return self._server_app
+
+    @property
+    def server_app(self):
+        return self._server_app
 
     on_message = _deco_maker('message')
-    on_event = _deco_maker('event')
+    on_notice = _deco_maker('notice')
+    on_event = _deco_maker('event')  # compatible with v3.x
     on_request = _deco_maker('request')
+    on_meta_event = _deco_maker('meta_event')
 
     def _handle(self):
         if self._secret:
-            # check signature
             if 'X-Signature' not in request.headers:
                 abort(401)
 
             sec = self._secret
-            if isinstance(sec, str):
-                sec = sec.encode('utf-8')
-            sig = hmac.new(sec, request.body.read(), 'sha1').hexdigest()
+            sec = sec.encode('utf-8') if isinstance(sec, str) else sec
+            sig = hmac.new(sec, request.get_data(), 'sha1').hexdigest()
             if request.headers['X-Signature'] != 'sha1=' + sig:
                 abort(403)
 
-        post_type = request.json.get('post_type')
-        if post_type not in ('message', 'event', 'request'):
+        payload = request.json
+        post_type = payload.get('post_type')
+
+        type_key = payload.get(
+            {'message': 'message_type',
+             'notice': 'notice_type',
+             'event': 'event',  # compatible with v3.x
+             'request': 'request_type',
+             'meta_event': 'meta_event_type'}.get(post_type)
+        )
+        if not type_key:
             abort(400)
 
-        handler_key = None
-        for pk_pair in (('message', 'message_type'),
-                        ('event', 'event'),
-                        ('request', 'request_type')):
-            if post_type == pk_pair[0]:
-                handler_key = request.json.get(pk_pair[1])
-                if not handler_key:
-                    abort(400)
-                else:
-                    break
-
-        if not handler_key:
-            abort(400)
-
-        handler = self._handlers[post_type].get(handler_key)
-        if not handler:
-            handler = self._handlers[post_type].get('*')  # try wildcard
+        handler = self._handlers[post_type].get(
+            type_key, self._handlers[post_type].get('*'))
         if handler:
-            assert callable(handler)
-            return handler(request.json)
+            response = handler(payload)
+            return jsonify(response) if isinstance(response, dict) else ''
         return ''
 
     def run(self, host=None, port=None, **kwargs):
-        self._app.run(host=host, port=port, **kwargs)
+        self._server_app.run(host=host, port=port, **kwargs)
 
     def send(self, context, message, **kwargs):
-        if context.get('group_id'):
-            return self.send_group_msg(group_id=context['group_id'],
-                                       message=message, **kwargs)
-        elif context.get('discuss_id'):
-            return self.send_discuss_msg(discuss_id=context['discuss_id'],
-                                         message=message, **kwargs)
-        elif context.get('user_id'):
-            return self.send_private_msg(user_id=context['user_id'],
-                                         message=message, **kwargs)
+        context = context.copy()
+        context['message'] = message
+        context.update(kwargs)
+        if 'message_type' not in context:
+            if 'group_id' in context:
+                context['message_type'] = 'group'
+            elif 'discuss_id' in context:
+                context['message_type'] = 'discuss'
+            elif 'user_id' in context:
+                context['message_type'] = 'private'
+        return self.send_msg(**context)
+
+    def __getattr__(self, item):
+        if self._api_root:
+            return _api_client(self._api_root + '/' + item, self._access_token)
